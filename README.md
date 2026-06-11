@@ -51,6 +51,21 @@ curl "http://localhost:3000/ilsintegrationservices/scaleapi/ShipmentHeadersApi/G
 
 Returns a JSON **array** of shipment objects with **PascalCase** property names, matching the real Scale API response shape.
 
+## Bearer token validation
+
+When `AUTH_APP_ID` is set (in `.env`), every request except `/health` must carry a JWT:
+
+```bash
+curl "http://localhost:3000/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get?shipmentId=DIRE1&warehouse=MN" \
+  -H "Authorization: Bearer <token>"
+```
+
+The orchestrator checks that the token is **not expired** (`exp` claim, 30s clock skew) and that its **application ID** (`appid` claim for Azure AD v1 tokens, `azp` for v2) matches one of the IDs in `AUTH_APP_ID` (comma-separated). Failures return `401` (missing/malformed/expired token) or `403` (wrong app ID). Leave `AUTH_APP_ID` unset to disable validation (local dev).
+
+> The token signature is **not** verified against Azure AD JWKS keys yet — this blocks expired and wrong-app tokens, not hand-forged ones. Add JWKS verification before exposing beyond a trusted network.
+
+The `Authorization` header is stripped before the request is forwarded to RabbitMQ, so tokens never reach the queue or the logging service.
+
 ## Worker API contract (internal / load tests)
 
 Send requests to the orchestrator with `X-Routing-Key: worker` and a JSON body:
@@ -150,7 +165,32 @@ Docker `worker-service` reads `.env` via `env_file`. Host scripts load the same 
 
 | Component | Other env vars |
 |-----------|----------------|
-| Orchestrator | `RABBITMQ_URL`, `ORCHESTRATOR_PORT`, `ORCHESTRATOR_REPLY_PREFETCH` |
+| Orchestrator | `RABBITMQ_URL`, `ORCHESTRATOR_PORT`, `ORCHESTRATOR_REPLY_PREFETCH`, `AUTH_APP_ID`, `AUTH_CLOCK_SKEW_S`, `RABBITMQ_RECONNECT_DELAY_MS`, `AUDIT_LOG_ENABLED`, `FORWARD_HEADERS` |
+| Logging | `RABBITMQ_URL`, `LOGGING_PREFETCH` (default 20), `RABBITMQ_RECONNECT_DELAY_MS`, `METRICS_ENABLED`, `METRICS_PORT`, `QUEUE_MONITOR_ENABLED`, `QUEUE_DEPTH_WARN_THRESHOLD` |
+
+All services automatically reconnect to RabbitMQ if the broker connection drops (default retry every 5s, override with `RABBITMQ_RECONNECT_DELAY_MS`). While disconnected, the orchestrator answers `503` and in-flight requests fail fast instead of hanging.
+
+## Observability
+
+The **logging-service is the observability hub**. All features are toggleable in `.env`:
+
+| Toggle | Default | What it does |
+|--------|---------|--------------|
+| `AUDIT_LOG_ENABLED` | `true` | Orchestrator publishes a fire-and-forget audit event per request (correlationId, method, path, routing key, status, duration) to the logging service |
+| `METRICS_ENABLED` | `true` | Logging service serves `GET :9100/metrics` — request counts by status/route, avg/max latency, queue depths |
+| `QUEUE_MONITOR_ENABLED` | `true` | Logging service polls RabbitMQ queue depths every 15s and logs a warning above `QUEUE_DEPTH_WARN_THRESHOLD` (default 100) |
+
+All log lines are structured JSON and include the `correlationId`, so a request can be traced across orchestrator → worker → audit log:
+
+```bash
+curl http://localhost:9100/metrics
+```
+
+## Shared route contracts
+
+Scale API endpoints are defined once in [config/scaleRoutes.js](config/scaleRoutes.js) (name, method, path pattern, routing key) and consumed by **both** the orchestrator (auto-routing) and the worker (dispatch). To add a new API (e.g. `ShipmentDetailsApi`), add the route there plus a query + mapper + handler in the worker — no regex duplication.
+
+The orchestrator forwards only an **allowlist of headers** into queue payloads (`content-type, accept, user-agent, warehouse, x-routing-key, x-scale-routing-key, x-request-id`; override with `FORWARD_HEADERS`). `Authorization`, cookies, and proxy headers never reach RabbitMQ or the logs.
 
 ## Documentation
 

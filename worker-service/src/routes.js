@@ -1,13 +1,10 @@
-const SCALE_SHIPMENT_HEADERS_GET =
-  /\/ilsintegrationservices\/scaleapi\/ShipmentHeadersApi\/Get\/?$/i;
+const { matchScaleRoute } = require("../config/scaleRoutes");
 
 const QUERY_SHIPMENT_BY_ID_WAREHOUSE = "ShipmentHeader.by.ShipmentId.and.Warehouse";
 
 function isScaleShipmentHeadersGet(payload) {
-  return (
-    String(payload.method || "").toUpperCase() === "GET" &&
-    SCALE_SHIPMENT_HEADERS_GET.test(payload.path || "")
-  );
+  const route = matchScaleRoute(payload.method, payload.path);
+  return route !== null && route.name === "ShipmentHeadersApi.Get";
 }
 
 function getShipmentHeadersParams(payload) {
@@ -28,7 +25,6 @@ function getShipmentHeadersParams(payload) {
 }
 
 module.exports = {
-  SCALE_SHIPMENT_HEADERS_GET,
   QUERY_SHIPMENT_BY_ID_WAREHOUSE,
   isScaleShipmentHeadersGet,
   getShipmentHeadersParams,

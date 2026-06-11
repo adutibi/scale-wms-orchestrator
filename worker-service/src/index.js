@@ -13,6 +13,7 @@ const EXCHANGE = "scale.topic";
 const ROUTING_KEY = "worker";
 const QUEUE = "scale.worker";
 const PREFETCH = Number(process.env.WORKER_PREFETCH) || 20;
+const RECONNECT_DELAY_MS = Number(process.env.RABBITMQ_RECONNECT_DELAY_MS) || 5000;
 
 function sendReply(channel, msg, payload) {
   const replyTo = msg.properties.replyTo;
@@ -52,6 +53,7 @@ async function handleScaleShipmentHeadersGet(channel, msg, payload) {
     const body = mapShipmentHeaderRows(result.rows);
     console.log("[WORKER] Scale API ShipmentHeadersApi/Get:", {
       at: new Date().toISOString(),
+      correlationId: payload.correlationId,
       shipmentId: extracted.params.shipmentID,
       warehouse: extracted.params.warehouse,
       rowCount: body.length,
@@ -97,6 +99,7 @@ async function handleNamedQuery(channel, msg, payload) {
     console.log("[WORKER] Query executed:", {
       service: "worker",
       at: new Date().toISOString(),
+      correlationId: payload.correlationId,
       query: queryName,
       rowCount: result.rowCount,
     });
@@ -135,6 +138,14 @@ async function run() {
   await getPool();
 
   const conn = await amqp.connect(RABBITMQ_URL);
+
+  conn.on("error", (err) => {
+    console.error("[WORKER] RabbitMQ connection error:", err.message);
+  });
+  conn.on("close", () => {
+    scheduleReconnect("connection closed");
+  });
+
   const channel = await conn.createChannel();
   await channel.assertExchange(EXCHANGE, "topic", { durable: true });
   await channel.assertQueue(QUEUE, { durable: true });
@@ -156,10 +167,20 @@ async function run() {
   console.log(`Worker service bound to ${ROUTING_KEY} (prefetch=${PREFETCH})`);
 }
 
+let reconnectTimer = null;
+
+function scheduleReconnect(reason) {
+  if (reconnectTimer) return;
+  console.error(`[WORKER] RabbitMQ ${reason} - reconnecting in ${RECONNECT_DELAY_MS}ms`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnect();
+  }, RECONNECT_DELAY_MS);
+}
+
 function reconnect() {
   run().catch((err) => {
-    console.error("Worker service connection failed:", err.message);
-    setTimeout(reconnect, 5000);
+    scheduleReconnect(`connection failed (${err.message})`);
   });
 }
 

@@ -6,6 +6,14 @@
  *   baseUrl      default http://localhost:3000
  *   count        default 100
  *   concurrency  default 10 (requests in flight)
+ *
+ * Environment:
+ *   SHOW_RESPONSES=N   print full JSON body for first N successful responses
+ *   RESPONSES_LOG=path append every response as one JSON line to file
+ *   AUTH_TOKEN=...     bearer token to send (when orchestrator auth is enabled)
+ *                      If unset and AUTH_APP_ID is set (.env), a synthetic
+ *                      unsigned token is generated (works while the
+ *                      orchestrator does not verify signatures).
  */
 
 const sql = require("mssql");
@@ -14,7 +22,30 @@ const { buildMssqlConfig } = require("../config/database");
 const BASE_URL = (process.argv[2] || "http://localhost:3000").replace(/\/$/, "");
 const COUNT = Math.max(1, parseInt(process.argv[3], 10) || 100);
 const CONCURRENCY = Math.max(1, parseInt(process.argv[4], 10) || 10);
+const SCALE_API_PATH = "/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get";
+const USE_SCALE_API = process.env.USE_LEGACY_API !== "1";
 const QUERY_NAME = "ShipmentHeader.by.ShipmentId.and.Warehouse";
+const SHOW_RESPONSES = Math.max(0, parseInt(process.env.SHOW_RESPONSES || "0", 10) || 0);
+const RESPONSES_LOG = process.env.RESPONSES_LOG || "";
+const fs = RESPONSES_LOG ? require("fs") : null;
+let printedResponses = 0;
+
+function buildAuthHeaders() {
+  if (process.env.AUTH_TOKEN) {
+    return { Authorization: `Bearer ${process.env.AUTH_TOKEN}` };
+  }
+  const appId = (process.env.AUTH_APP_ID || "").split(",")[0].trim();
+  if (!appId) return {};
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const token =
+    b64({ alg: "RS256", typ: "JWT" }) +
+    "." +
+    b64({ appid: appId, exp: Math.floor(Date.now() / 1000) + 3600 }) +
+    ".load-test";
+  return { Authorization: `Bearer ${token}` };
+}
+
+const AUTH_HEADERS = buildAuthHeaders();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -52,31 +83,48 @@ async function callWorker(shipment) {
   const start = performance.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 35000);
+  const params = new URLSearchParams({
+    shipmentId: shipment.shipmentID,
+    warehouse: shipment.warehouse,
+  });
+  const url = USE_SCALE_API
+    ? `${BASE_URL}${SCALE_API_PATH}?${params}`
+    : `${BASE_URL}/query`;
   try {
-    const res = await fetch(`${BASE_URL}/query`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Routing-Key": "worker",
-      },
-      body: JSON.stringify({
-        query: QUERY_NAME,
-        params: {
-          shipmentID: shipment.shipmentID,
-          warehouse: shipment.warehouse,
-        },
-      }),
+    const res = await fetch(url, {
+      method: USE_SCALE_API ? "GET" : "POST",
+      headers: USE_SCALE_API
+        ? { ...AUTH_HEADERS }
+        : {
+            "Content-Type": "application/json",
+            "X-Routing-Key": "worker",
+            ...AUTH_HEADERS,
+          },
+      body: USE_SCALE_API
+        ? undefined
+        : JSON.stringify({
+            query: QUERY_NAME,
+            params: {
+              shipmentID: shipment.shipmentID,
+              warehouse: shipment.warehouse,
+            },
+          }),
       signal: controller.signal,
     });
     clearTimeout(timeout);
     const elapsedMs = performance.now() - start;
     const bodyText = await res.text();
     let rows = 0;
+    let body = bodyText;
     try {
-      const parsed = JSON.parse(bodyText);
-      rows = Array.isArray(parsed.rows) ? parsed.rows.length : 0;
+      body = JSON.parse(bodyText);
+      if (Array.isArray(body)) {
+        rows = body.length;
+      } else if (Array.isArray(body.rows)) {
+        rows = body.rows.length;
+      }
     } catch {
-      // ignore parse errors
+      // keep raw bodyText
     }
     return {
       ok: res.ok,
@@ -85,7 +133,9 @@ async function callWorker(shipment) {
       shipmentID: shipment.shipmentID,
       warehouse: shipment.warehouse,
       rows,
-      error: res.ok ? null : bodyText.slice(0, 120),
+      body,
+      url,
+      error: res.ok ? null : bodyText.slice(0, 200),
     };
   } catch (err) {
     clearTimeout(timeout);
@@ -96,8 +146,38 @@ async function callWorker(shipment) {
       shipmentID: shipment.shipmentID,
       warehouse: shipment.warehouse,
       rows: 0,
+      body: null,
+      url,
       error: err.message,
     };
+  }
+}
+
+function logResponse(n, r) {
+  const entry = {
+    request: n,
+    ok: r.ok,
+    status: r.status,
+    elapsedMs: Math.round(r.elapsedMs * 10) / 10,
+    shipmentId: r.shipmentID,
+    warehouse: r.warehouse,
+    rowCount: r.rows,
+    url: r.url,
+    body: r.body,
+    error: r.error,
+  };
+
+  if (RESPONSES_LOG && fs) {
+    fs.appendFileSync(RESPONSES_LOG, JSON.stringify(entry) + "\n");
+  }
+
+  if (r.ok && printedResponses < SHOW_RESPONSES) {
+    printedResponses++;
+    log(`--- Response #${n} ---`);
+    log(`URL: ${r.url}`);
+    log(`Status: ${r.status} | ${r.elapsedMs.toFixed(1)}ms | rows=${r.rows}`);
+    console.log(JSON.stringify(r.body, null, 2));
+    log("---");
   }
 }
 
@@ -116,6 +196,12 @@ async function main() {
   const shipments = buildShipmentList(pool, COUNT);
   log(`Pool: ${pool.length} shipments, running ${COUNT} API calls (concurrency ${CONCURRENCY})...`);
   log(`Orchestrator: ${BASE_URL}`);
+  log(`API mode: ${USE_SCALE_API ? "Scale GET " + SCALE_API_PATH : "legacy POST /query"}`);
+  if (SHOW_RESPONSES > 0) log(`Showing first ${SHOW_RESPONSES} response bodies`);
+  if (RESPONSES_LOG) {
+    fs.writeFileSync(RESPONSES_LOG, "");
+    log(`Logging all responses to: ${RESPONSES_LOG}`);
+  }
   if (verbose) log("---");
 
   const wallStart = performance.now();
@@ -136,10 +222,16 @@ async function main() {
             `shipment=${r.shipmentID} warehouse=${r.warehouse} rows=${r.rows}` +
             (r.error ? ` error=${r.error}` : "")
         );
+        logResponse(n, r);
       }
-    } else if (results.length % 1000 < CONCURRENCY || results.length === shipments.length) {
+    } else {
+      for (let j = 0; j < batchResults.length; j++) {
+        logResponse(i + j + 1, batchResults[j]);
+      }
+      if (results.length % 1000 < CONCURRENCY || results.length === shipments.length) {
       const batchErrors = batchResults.filter((r) => !r.ok).length;
-      log(`Progress: ${results.length}/${COUNT} (${((results.length / COUNT) * 100).toFixed(1)}%) batchErrors=${batchErrors}`);
+        log(`Progress: ${results.length}/${COUNT} (${((results.length / COUNT) * 100).toFixed(1)}%) batchErrors=${batchErrors}`);
+      }
     }
   }
 
@@ -160,6 +252,7 @@ async function main() {
   log(`  Latency p95:   ${percentile(times, 95).toFixed(1)}ms`);
   log(`  Latency max:   ${times[times.length - 1]?.toFixed(1)}ms`);
   log(`  Latency avg:   ${(times.reduce((a, b) => a + b, 0) / times.length).toFixed(1)}ms`);
+  if (RESPONSES_LOG) log(`  Responses log: ${RESPONSES_LOG}`);
 
   if (errors > 0) process.exit(1);
 }

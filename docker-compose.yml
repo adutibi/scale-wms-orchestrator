@@ -15,13 +15,19 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    build: ./orchestrator
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
     ports:
       - "3000:3000"
     environment:
       RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
       ORCHESTRATOR_PORT: 3000
       ORCHESTRATOR_REPLY_PREFETCH: 50
+      # Bearer token validation (empty = disabled). Reads from .env.
+      AUTH_APP_ID: ${AUTH_APP_ID:-}
+      # Per-request audit events to logging-service ("false" = off)
+      AUDIT_LOG_ENABLED: ${AUDIT_LOG_ENABLED:-true}
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -29,8 +35,16 @@ services:
 
   logging-service:
     build: ./logging-service
+    ports:
+      - "9100:9100" # /metrics
     environment:
       RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
+      LOGGING_PREFETCH: 20
+      # Observability toggles
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_PORT: 9100
+      QUEUE_MONITOR_ENABLED: ${QUEUE_MONITOR_ENABLED:-true}
+      QUEUE_DEPTH_WARN_THRESHOLD: ${QUEUE_DEPTH_WARN_THRESHOLD:-100}
     depends_on:
       rabbitmq:
         condition: service_healthy
