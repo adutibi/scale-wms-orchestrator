@@ -54,6 +54,8 @@ Set-Location $projectRoot
 
 Ensure-DockerReady
 
-Write-Host "Starting compose stack from $projectRoot with $WorkerCount worker containers..."
+Write-Host "Starting compose stack (TRANSPORT=http, no RabbitMQ) from $projectRoot with $WorkerCount worker containers..."
+$env:TRANSPORT = "http"
+$env:WORKER_URLS = "http://worker-service:4001"
 & docker compose -f $ComposeFile up -d --build --scale worker-service=$WorkerCount
 exit $LASTEXITCODE

@@ -1,9 +1,10 @@
 services:
   rabbitmq:
+    profiles: ["rabbitmq"]
     image: rabbitmq:3.12-management-alpine
     ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI
+      - "5672:5672"
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: scale
       RABBITMQ_DEFAULT_PASS: scale_secret
@@ -20,34 +21,32 @@ services:
       dockerfile: orchestrator/Dockerfile
     ports:
       - "3001:3000"
+    env_file:
+      - .env
     environment:
-      RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
       ORCHESTRATOR_PORT: 3000
+      TRANSPORT: ${TRANSPORT:-http}
+      WORKER_URLS: ${WORKER_URLS:-http://worker-service:4001}
+      LOGGING_HTTP_URL: ${LOGGING_HTTP_URL:-http://logging-service:4101}
       ORCHESTRATOR_REPLY_PREFETCH: 50
-      # Bearer token validation (empty = disabled). Reads from .env.
       AUTH_APP_ID: ${AUTH_APP_ID:-}
-      # Per-request audit events to logging-service ("false" = off)
       AUDIT_LOG_ENABLED: ${AUDIT_LOG_ENABLED:-true}
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
     restart: unless-stopped
 
   logging-service:
     build: ./logging-service
     ports:
-      - "9100:9100" # /metrics
+      - "9100:9100"
+      - "4101:4101"
+    env_file:
+      - .env
     environment:
-      RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
-      LOGGING_PREFETCH: 20
-      # Observability toggles
+      TRANSPORT: ${TRANSPORT:-http}
+      LOGGING_HTTP_PORT: 4101
       METRICS_ENABLED: ${METRICS_ENABLED:-true}
       METRICS_PORT: 9100
-      QUEUE_MONITOR_ENABLED: ${QUEUE_MONITOR_ENABLED:-true}
+      QUEUE_MONITOR_ENABLED: ${QUEUE_MONITOR_ENABLED:-false}
       QUEUE_DEPTH_WARN_THRESHOLD: ${QUEUE_DEPTH_WARN_THRESHOLD:-100}
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
     restart: unless-stopped
 
   worker-service:
@@ -57,8 +56,10 @@ services:
     env_file:
       - .env
     environment:
-      RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
+      TRANSPORT: ${TRANSPORT:-http}
+      WORKER_HTTP_PORT: 4001
+    expose:
+      - "4001"
+    extra_hosts:
+      - "Wms-qasql:10.16.36.212"
     restart: unless-stopped
