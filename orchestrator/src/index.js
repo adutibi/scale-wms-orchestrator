@@ -1,81 +1,18 @@
 const express = require("express");
-const amqp = require("amqplib");
 const crypto = require("crypto");
 const { authMiddleware } = require("./auth");
 const { matchScaleRoute } = require("../config/scaleRoutes");
 
-const RABBITMQ_URL = process.env.RABBITMQ_URL || "amqp://localhost:5672";
-const EXCHANGE = "scale.topic";
-const REPLY_QUEUE = "orchestrator.replies";
+const TRANSPORT = (process.env.TRANSPORT || "http").toLowerCase();
 const ROUTING_HEADER = "x-routing-key";
-const REPLY_TIMEOUT_MS = Number(process.env.REPLY_TIMEOUT_MS) || 30000;
-const RECONNECT_DELAY_MS = Number(process.env.RABBITMQ_RECONNECT_DELAY_MS) || 5000;
+const AUDIT_LOG_ENABLED = (process.env.AUDIT_LOG_ENABLED || "true").toLowerCase() !== "false";
 
-let channel = null;
-let reconnectTimer = null;
-const pendingReplies = new Map();
-
-function failPendingReplies(err) {
-  for (const [correlationId, pending] of pendingReplies) {
-    clearTimeout(pending.timeoutHandle);
-    pendingReplies.delete(correlationId);
-    pending.reject(err);
-  }
-}
-
-function scheduleReconnect(reason) {
-  if (reconnectTimer) return;
-  console.error(`RabbitMQ ${reason} - reconnecting in ${RECONNECT_DELAY_MS}ms`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectWithRetry();
-  }, RECONNECT_DELAY_MS);
-}
-
-async function connectRabbitMQ() {
-  const conn = await amqp.connect(RABBITMQ_URL);
-
-  conn.on("error", (err) => {
-    console.error("RabbitMQ connection error:", err.message);
-  });
-  conn.on("close", () => {
-    channel = null;
-    failPendingReplies(new Error("RabbitMQ connection lost"));
-    scheduleReconnect("connection closed");
-  });
-
-  channel = await conn.createChannel();
-  await channel.assertExchange(EXCHANGE, "topic", { durable: true });
-  await channel.assertQueue(REPLY_QUEUE, { durable: true });
-  channel.prefetch(Number(process.env.ORCHESTRATOR_REPLY_PREFETCH) || 50);
-
-  channel.consume(REPLY_QUEUE, (msg) => {
-    if (!msg) return;
-    const correlationId = msg.properties.correlationId;
-    const pending = correlationId ? pendingReplies.get(correlationId) : null;
-    if (pending) {
-      clearTimeout(pending.timeoutHandle);
-      pendingReplies.delete(correlationId);
-      try {
-        const raw = msg.content.toString();
-        let payload;
-        try {
-          payload = JSON.parse(raw);
-        } catch {
-          payload = { body: raw };
-        }
-        const statusCode = payload.statusCode ?? 200;
-        const body = payload.body !== undefined ? payload.body : payload;
-        pending.resolve({ statusCode, body });
-      } catch (err) {
-        pending.reject(err);
-      }
-    }
-    channel.ack(msg);
-  });
-
-  return channel;
-}
+const transport =
+  TRANSPORT === "rabbitmq"
+    ? require("./transport-rabbitmq")
+    : TRANSPORT === "nats"
+      ? require("./transport-nats")
+      : require("./transport-http");
 
 function getRoutingKey(req) {
   const key = req.get(ROUTING_HEADER) || req.get("X-Routing-Key") || req.get("x-scale-routing-key");
@@ -85,8 +22,6 @@ function getRoutingKey(req) {
   return null;
 }
 
-// Only these client headers are forwarded into queue payloads; everything
-// else (Authorization, cookies, proxy headers, ...) is dropped.
 const DEFAULT_FORWARD_HEADERS =
   "content-type,accept,user-agent,warehouse,x-routing-key,x-scale-routing-key,x-request-id";
 const FORWARD_HEADERS = new Set(
@@ -104,28 +39,19 @@ function pickForwardedHeaders(headers) {
   return out;
 }
 
-// Fire-and-forget audit event per request, consumed by logging-service.
-const AUDIT_LOG_ENABLED = (process.env.AUDIT_LOG_ENABLED || "true").toLowerCase() !== "false";
-
 function publishAuditEvent(event) {
-  if (!AUDIT_LOG_ENABLED || !channel) return;
-  try {
-    const content = Buffer.from(JSON.stringify({ type: "audit", ...event }));
-    channel.publish(EXCHANGE, "logging", content, { contentType: "application/json" });
-  } catch {
-    // Auditing must never break the request path.
-  }
+  if (!AUDIT_LOG_ENABLED) return;
+  transport.publishAuditEvent(event);
 }
 
-function waitForReply(correlationId) {
-  return new Promise((resolve, reject) => {
-    const timeoutHandle = setTimeout(() => {
-      if (pendingReplies.delete(correlationId)) {
-        reject(new Error("Reply timeout"));
-      }
-    }, REPLY_TIMEOUT_MS);
-    pendingReplies.set(correlationId, { resolve, reject, timeoutHandle });
-  });
+async function forwardRequest(routingKey, payload) {
+  if (routingKey === "worker") {
+    return transport.forwardToWorker(payload);
+  }
+  if (routingKey === "logging") {
+    return transport.forwardToLogging(payload);
+  }
+  throw new Error(`Unknown routing key: ${routingKey}`);
 }
 
 const app = express();
@@ -133,7 +59,12 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.text({ type: "*/*", limit: "10mb" }));
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "orchestrator" });
+  res.json({
+    status: "ok",
+    service: "orchestrator",
+    transport: TRANSPORT,
+    backendReady: transport.isReady(),
+  });
 });
 
 app.use(authMiddleware());
@@ -147,8 +78,14 @@ app.all("*", async (req, res) => {
     });
   }
 
-  if (!channel) {
-    return res.status(503).json({ error: "Orchestrator not connected to RabbitMQ" });
+  if (!transport.isReady()) {
+    const hint =
+      TRANSPORT === "rabbitmq"
+        ? "Orchestrator not connected to RabbitMQ"
+        : TRANSPORT === "nats"
+          ? "Orchestrator not connected to NATS"
+          : "Configure WORKER_URLS / LOGGING_HTTP_URL";
+    return res.status(503).json({ error: "Service unavailable", message: hint });
   }
 
   const correlationId = crypto.randomUUID();
@@ -165,15 +102,7 @@ app.all("*", async (req, res) => {
   };
 
   try {
-    const content = Buffer.from(JSON.stringify(payload));
-    channel.publish(EXCHANGE, routingKey, content, {
-      persistent: true,
-      contentType: "application/json",
-      replyTo: REPLY_QUEUE,
-      correlationId,
-    });
-
-    const reply = await waitForReply(correlationId);
+    const reply = await forwardRequest(routingKey, payload);
     const status = reply.statusCode ?? 200;
     publishAuditEvent({
       correlationId,
@@ -197,7 +126,11 @@ app.all("*", async (req, res) => {
     }
   } catch (err) {
     const failureStatus =
-      err.message === "Reply timeout" ? 504 : err.message === "RabbitMQ connection lost" ? 503 : 500;
+      err.message === "Reply timeout"
+        ? 504
+        : err.message === "RabbitMQ connection lost" || err.message === "NATS connection lost"
+          ? 503
+          : 500;
     publishAuditEvent({
       correlationId,
       method: req.method,
@@ -212,27 +145,19 @@ app.all("*", async (req, res) => {
       return res.status(504).json({ error: "Gateway timeout", message: "Microservice did not respond in time" });
     }
     if (failureStatus === 503) {
-      return res.status(503).json({ error: "Service unavailable", message: "Broker connection lost, retry shortly" });
+      return res.status(503).json({ error: "Service unavailable", message: err.message });
     }
     console.error("Orchestrator error:", { correlationId, error: err.message });
-    res.status(500).json({ error: "Failed to forward request" });
+    res.status(500).json({ error: "Failed to forward request", message: err.message });
   }
 });
 
 const PORT = Number(process.env.ORCHESTRATOR_PORT) || 3000;
 
-function connectWithRetry() {
-  connectRabbitMQ()
-    .then(() => {
-      console.log("Connected to RabbitMQ");
-    })
-    .catch((err) => {
-      scheduleReconnect(`connection failed (${err.message})`);
-    });
-}
-
-// Start HTTP immediately; requests get 503 until the broker connection is up.
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Orchestrator listening on port ${PORT} (request-reply)`);
+  console.log(`Orchestrator listening on port ${PORT} (transport=${TRANSPORT})`);
 });
-connectWithRetry();
+
+if (TRANSPORT === "rabbitmq" || TRANSPORT === "nats") {
+  transport.connectWithRetry();
+}
