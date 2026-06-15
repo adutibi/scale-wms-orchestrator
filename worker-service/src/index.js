@@ -1,4 +1,5 @@
 const amqp = require("amqplib");
+const { performance } = require("perf_hooks");
 const queries = require("./queries");
 const { getPool, runNamedQuery } = require("./db");
 const { mapShipmentHeaderRows } = require("./mappers/shipmentHeader");
@@ -14,6 +15,12 @@ const ROUTING_KEY = "worker";
 const QUEUE = "scale.worker";
 const PREFETCH = Number(process.env.WORKER_PREFETCH) || 20;
 const RECONNECT_DELAY_MS = Number(process.env.RABBITMQ_RECONNECT_DELAY_MS) || 5000;
+const REQUEST_LOG_ENABLED = (process.env.WORKER_REQUEST_LOG_ENABLED || "false").toLowerCase() === "true";
+const TIMING_TRACE_ENABLED = (process.env.WORKER_TIMING_TRACE_ENABLED || "false").toLowerCase() === "true";
+
+function roundMs(value) {
+  return Math.round(value * 10) / 10;
+}
 
 function sendReply(channel, msg, payload) {
   const replyTo = msg.properties.replyTo;
@@ -39,7 +46,7 @@ function extractQueryRequest(payload) {
   return { queryName, params };
 }
 
-async function handleScaleShipmentHeadersGet(channel, msg, payload) {
+async function handleScaleShipmentHeadersGet(channel, msg, payload, context) {
   const extracted = getShipmentHeadersParams(payload);
   if (extracted.error) {
     sendReply(channel, msg, { statusCode: 400, body: { error: extracted.error } });
@@ -49,16 +56,29 @@ async function handleScaleShipmentHeadersGet(channel, msg, payload) {
 
   const queryDef = queries[QUERY_SHIPMENT_BY_ID_WAREHOUSE];
   try {
+    const queryStartedAt = performance.now();
     const result = await runNamedQuery(queryDef, extracted.params);
+    const queryFinishedAt = performance.now();
     const body = mapShipmentHeaderRows(result.rows);
-    console.log("[WORKER] Scale API ShipmentHeadersApi/Get:", {
-      at: new Date().toISOString(),
-      correlationId: payload.correlationId,
-      shipmentId: extracted.params.shipmentID,
-      warehouse: extracted.params.warehouse,
-      rowCount: body.length,
-    });
-    sendReply(channel, msg, { statusCode: 200, body });
+    if (REQUEST_LOG_ENABLED) {
+      console.log("[WORKER] Scale API ShipmentHeadersApi/Get:", {
+        at: new Date().toISOString(),
+        correlationId: payload.correlationId,
+        shipmentId: extracted.params.shipmentID,
+        warehouse: extracted.params.warehouse,
+        rowCount: body.length,
+      });
+    }
+    const replyBody = TIMING_TRACE_ENABLED
+      ? {
+          rows: body,
+          timings: {
+            queryMs: roundMs(queryFinishedAt - queryStartedAt),
+            workerMs: roundMs(performance.now() - context.messageReceivedAt),
+          },
+        }
+      : body;
+    sendReply(channel, msg, { statusCode: 200, body: replyBody });
     channel.ack(msg);
   } catch (err) {
     console.error("[WORKER] ShipmentHeadersApi/Get error:", err.message);
@@ -67,7 +87,7 @@ async function handleScaleShipmentHeadersGet(channel, msg, payload) {
   }
 }
 
-async function handleNamedQuery(channel, msg, payload) {
+async function handleNamedQuery(channel, msg, payload, context) {
   const extracted = extractQueryRequest(payload);
   if (extracted.error) {
     sendReply(channel, msg, {
@@ -95,14 +115,24 @@ async function handleNamedQuery(channel, msg, payload) {
   }
 
   try {
+    const queryStartedAt = performance.now();
     const result = await runNamedQuery(queryDef, params);
-    console.log("[WORKER] Query executed:", {
-      service: "worker",
-      at: new Date().toISOString(),
-      correlationId: payload.correlationId,
-      query: queryName,
-      rowCount: result.rowCount,
-    });
+    const queryFinishedAt = performance.now();
+    if (REQUEST_LOG_ENABLED) {
+      console.log("[WORKER] Query executed:", {
+        service: "worker",
+        at: new Date().toISOString(),
+        correlationId: payload.correlationId,
+        query: queryName,
+        rowCount: result.rowCount,
+      });
+    }
+    const timings = TIMING_TRACE_ENABLED
+      ? {
+          queryMs: roundMs(queryFinishedAt - queryStartedAt),
+          workerMs: roundMs(performance.now() - context.messageReceivedAt),
+        }
+      : null;
     sendReply(channel, msg, {
       statusCode: 200,
       body: {
@@ -110,6 +140,7 @@ async function handleNamedQuery(channel, msg, payload) {
         query: queryName,
         rowCount: result.rowCount,
         rows: result.rows,
+        ...(timings ? { timings } : {}),
       },
     });
     channel.ack(msg);
@@ -124,14 +155,16 @@ async function handleNamedQuery(channel, msg, payload) {
 }
 
 async function processMessage(channel, msg) {
+  const messageReceivedAt = performance.now();
   const payload = JSON.parse(msg.content.toString());
+  const context = { messageReceivedAt };
 
   if (isScaleShipmentHeadersGet(payload)) {
-    await handleScaleShipmentHeadersGet(channel, msg, payload);
+    await handleScaleShipmentHeadersGet(channel, msg, payload, context);
     return;
   }
 
-  await handleNamedQuery(channel, msg, payload);
+  await handleNamedQuery(channel, msg, payload, context);
 }
 
 async function run() {

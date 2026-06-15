@@ -24,9 +24,8 @@ module.exports = {
     sql: `
       SELECT sh.*
       FROM SHIPMENT_HEADER sh
-      INNER JOIN WAREHOUSE w ON sh.warehouse = w.warehouse
       WHERE sh.SHIPMENT_ID = @shipmentID
-        AND w.warehouse = @warehouse
+        AND sh.warehouse = @warehouse
     `,
     params: {
       shipmentID: "NVarChar",

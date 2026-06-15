@@ -19,7 +19,7 @@ services:
       context: .
       dockerfile: orchestrator/Dockerfile
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       RABBITMQ_URL: amqp://scale:scale_secret@rabbitmq:5672
       ORCHESTRATOR_PORT: 3000

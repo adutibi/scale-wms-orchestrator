@@ -3,5 +3,9 @@ node_modules/
 *.log
 .DS_Store
 
+# Benchmark response dumps may contain real customer data from the DB
+bench-qa-*.jsonl
+*.responses.jsonl
+
 # OpenMemory - IDE/Assistant specific rules
 .cursor/rules/openmemory.mdc

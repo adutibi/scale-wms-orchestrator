@@ -44,4 +44,12 @@ node scripts/capacity-test.js http://localhost:3000 20 300
 node scripts/capacity-test.js http://localhost:3000 10 10
 ```
 
+**Remote server example:**
+
+```bash
+node scripts/capacity-test.js http://192.168.1.50:3001 20 300
+```
+
+Replace `192.168.1.50` with the server's LAN IP. Use the published host port for the orchestrator (`3001` in this workspace).
+
 **Output:** Start/end timestamps per service, duration, success/error counts, requests per second, and a summary. Exits with code 1 if worker throughput is below 10 req/s.
