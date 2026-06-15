@@ -166,8 +166,12 @@ app.all("*", async (req, res) => {
 
   try {
     const content = Buffer.from(JSON.stringify(payload));
+    // Transient delivery: these are synchronous request-reply messages tied to
+    // an in-memory pending promise. If the broker restarts mid-flight the caller
+    // already loses its reply, so disk persistence buys nothing and adds fsync
+    // latency to every request.
     channel.publish(EXCHANGE, routingKey, content, {
-      persistent: true,
+      persistent: false,
       contentType: "application/json",
       replyTo: REPLY_QUEUE,
       correlationId,

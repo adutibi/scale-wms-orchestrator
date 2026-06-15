@@ -11,9 +11,7 @@
  *   SHOW_RESPONSES=N   print full JSON body for first N successful responses
  *   RESPONSES_LOG=path append every response as one JSON line to file
  *   AUTH_TOKEN=...     bearer token to send (when orchestrator auth is enabled)
- *                      If unset and AUTH_APP_ID is set (.env), a synthetic
- *                      unsigned token is generated (works while the
- *                      orchestrator does not verify signatures).
+ *                      If unset, a synthetic unsigned token is generated.
  */
 
 const sql = require("mssql");
@@ -34,13 +32,11 @@ function buildAuthHeaders() {
   if (process.env.AUTH_TOKEN) {
     return { Authorization: `Bearer ${process.env.AUTH_TOKEN}` };
   }
-  const appId = (process.env.AUTH_APP_ID || "").split(",")[0].trim();
-  if (!appId) return {};
   const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const token =
     b64({ alg: "RS256", typ: "JWT" }) +
     "." +
-    b64({ appid: appId, exp: Math.floor(Date.now() / 1000) + 3600 }) +
+    b64({ exp: Math.floor(Date.now() / 1000) + 3600 }) +
     ".load-test";
   return { Authorization: `Bearer ${token}` };
 }
@@ -49,6 +45,14 @@ const AUTH_HEADERS = buildAuthHeaders();
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+function formatTimings(timings) {
+  if (!timings) return "";
+  const parts = [];
+  if (typeof timings.queryMs === "number") parts.push(`query=${timings.queryMs.toFixed(1)}ms`);
+  if (typeof timings.workerMs === "number") parts.push(`worker=${timings.workerMs.toFixed(1)}ms`);
+  return parts.length ? ` | ${parts.join(" | ")}` : "";
 }
 
 function percentile(sorted, p) {
@@ -165,6 +169,7 @@ function logResponse(n, r) {
     url: r.url,
     body: r.body,
     error: r.error,
+    timings: r.body && r.body.timings ? r.body.timings : undefined,
   };
 
   if (RESPONSES_LOG && fs) {
@@ -176,6 +181,9 @@ function logResponse(n, r) {
     log(`--- Response #${n} ---`);
     log(`URL: ${r.url}`);
     log(`Status: ${r.status} | ${r.elapsedMs.toFixed(1)}ms | rows=${r.rows}`);
+    if (r.body && r.body.timings) {
+      log(`Timings:${formatTimings(r.body.timings)}`);
+    }
     console.log(JSON.stringify(r.body, null, 2));
     log("---");
   }
@@ -220,6 +228,7 @@ async function main() {
         log(
           `#${String(n).padStart(3)} ${status} ${r.elapsedMs.toFixed(1)}ms ` +
             `shipment=${r.shipmentID} warehouse=${r.warehouse} rows=${r.rows}` +
+            (r.body && r.body.timings ? formatTimings(r.body.timings) : "") +
             (r.error ? ` error=${r.error}` : "")
         );
         logResponse(n, r);
