@@ -15,8 +15,32 @@ Orchestrator API that receives requests from the warehouse management system (Sc
 docker compose up -d --build
 ```
 
-- **Orchestrator:** http://localhost:3000  
+- **Orchestrator:** http://localhost:3001  
 - **RabbitMQ Management:** http://localhost:15672 (user: `scale`, pass: `scale_secret`)
+
+## Windows CLI startup
+
+If you want Windows to start the stack automatically without Docker Desktop, use the PowerShell scripts in [scripts/windows](scripts/windows).
+
+Install the startup task from an elevated PowerShell window:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\install-startup-task.ps1
+```
+
+That task runs at Windows startup, starts the Docker service if one is available, waits for the Docker daemon, and then starts the project with 10 worker containers.
+
+To start it now, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-project.ps1
+```
+
+To remove the startup task later:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\install-startup-task.ps1 -Remove
+```
 
 See **docs/DOCKER-INSTALL.md** for installing Docker on macOS.
 
@@ -46,7 +70,7 @@ node scripts/test-db-connection.js
 Drop-in replacement for the Scale integration GET endpoint (no routing header required):
 
 ```bash
-curl "http://localhost:3000/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get?shipmentId=DIRE1&warehouse=MN"
+curl "http://localhost:3001/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get?shipmentId=DIRE1&warehouse=MN"
 ```
 
 Returns a JSON **array** of shipment objects with **PascalCase** property names, matching the real Scale API response shape.
@@ -56,11 +80,11 @@ Returns a JSON **array** of shipment objects with **PascalCase** property names,
 When `AUTH_APP_ID` is set (in `.env`), every request except `/health` must carry a JWT:
 
 ```bash
-curl "http://localhost:3000/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get?shipmentId=DIRE1&warehouse=MN" \
+curl "http://localhost:3001/ilsintegrationservices/scaleapi/ShipmentHeadersApi/Get?shipmentId=DIRE1&warehouse=MN" \
   -H "Authorization: Bearer <token>"
 ```
 
-The orchestrator checks that the token is **not expired** (`exp` claim, 30s clock skew) and that its **application ID** (`appid` claim for Azure AD v1 tokens, `azp` for v2) matches one of the IDs in `AUTH_APP_ID` (comma-separated). Failures return `401` (missing/malformed/expired token) or `403` (wrong app ID). Leave `AUTH_APP_ID` unset to disable validation (local dev).
+The orchestrator checks that the token is **not expired** (`exp` claim, 30s clock skew). Failures return `401` (missing/malformed/expired token). Leave `AUTH_APP_ID` unset to disable validation (local dev).
 
 > The token signature is **not** verified against Azure AD JWKS keys yet — this blocks expired and wrong-app tokens, not hand-forged ones. Add JWKS verification before exposing beyond a trusted network.
 
@@ -79,7 +103,7 @@ Built-in queries: `ping`, `db-info`, `list-tables`, `ShipmentHeader.by.ShipmentI
 **Example:**
 
 ```bash
-curl -X POST http://localhost:3000/query \
+curl -X POST http://localhost:3001/query \
   -H "X-Routing-Key: worker" \
   -H "Content-Type: application/json" \
   -d '{"query":"ping"}'
@@ -115,7 +139,7 @@ node scripts/capacity-test.js [baseUrl] [concurrency] [requestsPerService]
 
 | Argument             | Default                | Description                    |
 |----------------------|------------------------|--------------------------------|
-| baseUrl              | http://localhost:3000  | Orchestrator base URL          |
+| baseUrl              | http://localhost:3001  | Orchestrator base URL          |
 | concurrency          | 100                    | Requests in flight per service |
 | requestsPerService   | 1000                   | Requests per routing key       |
 
@@ -123,8 +147,8 @@ node scripts/capacity-test.js [baseUrl] [concurrency] [requestsPerService]
 
 ```bash
 node scripts/capacity-test.js
-node scripts/capacity-test.js http://localhost:3000 20 300
-node scripts/capacity-test.js http://localhost:3000 10 10
+node scripts/capacity-test.js http://localhost:3001 20 300
+node scripts/capacity-test.js http://localhost:3001 10 10
 ```
 
 ## Routing (headers)
@@ -139,9 +163,9 @@ Set the routing key in an HTTP header. The orchestrator checks (in order): `x-ro
 **Quick test:**
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:3001/health
 
-curl -X POST http://localhost:3000/any/path \
+curl -X POST http://localhost:3001/any/path \
   -H "X-Routing-Key: logging" \
   -H "Content-Type: application/json" \
   -d '{"event":"test"}'
@@ -153,13 +177,15 @@ curl -X POST http://localhost:3000/any/path \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_SERVER` | `192.168.123.242` | SQL Server host (use LAN IP for Docker) |
+| `DB_SERVER` | `Wms-sql1` | SQL Server host (use LAN IP for Docker) |
 | `DB_PORT` | `1433` | TCP port (preferred over instance name) |
 | `DB_INSTANCE` | — | Named instance if not using `DB_PORT` |
 | `DB_NAME` | `ils` | Database name |
 | `DB_USER` / `DB_PASSWORD` | — | Login credentials |
-| `DB_POOL_MAX` | `20` | Connection pool size per worker |
-| `WORKER_PREFETCH` | `20` | RabbitMQ prefetch per worker |
+| `DB_POOL_MAX` | `30` | Connection pool size per worker |
+| `WORKER_PREFETCH` | `50` | RabbitMQ prefetch per worker |
+| `WORKER_REQUEST_LOG_ENABLED` | `false` | Per-request worker logging (benchmark off) |
+| `WORKER_TIMING_TRACE_ENABLED` | `false` | Adds query/worker timing info to worker replies |
 
 Docker `worker-service` reads `.env` via `env_file`. Host scripts load the same file automatically.
 
@@ -216,3 +242,6 @@ The orchestrator forwards only an **allowlist of headers** into queue payloads (
     ├── test-db-connection.js
     └── README.md
 ```
+
+
+Build with 10 workers: docker compose up -d --build --scale worker-service=10
